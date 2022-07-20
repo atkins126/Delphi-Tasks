@@ -2,7 +2,7 @@
  Small and simple: Thread Pools with Tasks
 
 I needed some better constructs than what was available in Delphi 2009, to be more productive with one of my major programs (this runs as a critical service 7x24, with hundreds of threads, but also short-living parallel activities to manage timeouts and some monitoring).
-I felt that I needed better program constructs than Delphi's TThread class, a better way of handling threads, by a built-in and safe way to start tasks, wait for completion of tasks, as also to cancel a task.
+I felt that I needed somthing better than Delphi's TThread class, that is, a better way of handling threads by a built-in and safe way to start tasks, wait for completion of tasks, as also to cancel a task.
 As for keeping the implementation as small and fast as possible, this is relying on pre-existing Windows constructs all the way (Slim RW Locks, Condition Variables, Events).
 
 ## Available objects (see Tasks.pas):
@@ -26,6 +26,14 @@ There is *no* heuristic to "tune" the thread pool(s): It is up to the applicatio
 
 Also note that Windows only schedules threads within a single, static group of CPU cores, assigned to the process at process startup. (https://docs.microsoft.com/en-us/windows/win32/procthread/processor-groups)
 
+## Notes:
+
+As always with methods that are used as callbacks (in this case: as task methods), you have to pay attention to the details of unit finalization in Delphi.
+For example, if you have a task that is performing a method from Unit B, and then code in the finalization section of Unit A is stopping that task, it is very possible
+that the finalization of unit B was carried out before the task reacts to the cancellation and finally ends.
+If this task assigns values to managed global variables (or "class variables") in unit B, these values (most commonly: strings) may never be cleaned up,
+since the cleanup of B's global variables is part of the unit finalization, which may have already been completed.
+Such errors lead to mysterious memory leaks.
 
 Tested with:
 - Delphi 2009
