@@ -2,7 +2,9 @@ unit MemTest;
 
 {
   This unit can be integrated into programs to verify correct memory management. From the point of view of the program,
-  only the speed is adversely affected and more memory is used.
+  only the speed is adversely affected and more memory is used. If the application attempts to call FreeMem or
+  ReallocMem with an invalid pointer, an error is written to the console window (if any) or to a trace file, and the
+  process terminates without the call returning.
 
   The complete functionality is controlled by the precompiler symbol MEMTEST_ACTIVE:
   - MEMTEST_ACTIVE is undefined (Release builds): Memory allocations are not intercepted in any way.
@@ -70,9 +72,9 @@ type
 	Title: PAnsiChar;
 
 	ExpectedMemInbalance: _NativeUInt;		// Memory that is expected to be not released at the end of the program
-	AllocMemSize: _NativeUInt;				// currently allocated bytes (without MemManager overhead)
+	AllocMemSize: _NativeUInt;				// currently allocated bytes (without the added overhead)
 	AllocMemBlocks: _NativeUInt;			// currently allocated blocks
-	MaxAllocMemSize: _NativeUInt;			// previous maximum value of MyAllocMemSize
+	MaxAllocMemSize: _NativeUInt;			// previous maximum value of AllocMemSize
 
 	AllocBreakAddr: pointer;				// triggers debug-break if this address is returned by GetMem or Realloc
 	FreeBreakAddr: pointer;					// triggers debug-break stop if this address is passed to Free or Realloc
@@ -96,13 +98,12 @@ var
 	FreeBreakSize: High(_NativeUInt);
   );
 
-  ComInitCount: integer;					// number of "open" CoInitialize calls, over all threads
-
-  // as to whether a debug-break should be triggered in the event of alloc errors (e.g. out of memory):
+  // as to whether a debug-break should be triggered in the event of alloc errors (e.g. out of memory) in GetMem or
+  // ReallocMem:
   MyBreakOnAllocationError: boolean;
 
 
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean = true);
 function IsMemoryValid: boolean;
 
 
@@ -319,7 +320,7 @@ type
 	function Dequeue(Payload: pointer): PPreRec;
 
 	function IsValidList: boolean;
-	procedure DumpList(Filename: PChar; DoLock, CheckForDelphiClasses: boolean);
+	procedure DumpList(Filename: PChar; DoLock, CheckForDelphiClasses, WithHexDump: boolean);
 	procedure CheckMemoryLeak(IsDelphiMem: boolean);
 	procedure MemErr(p: PPreRec);
 	class function IsValidBlock(P: PPreRec): boolean; static;
@@ -465,38 +466,41 @@ end;
  //===================================================================================================================
 function MyReallocMem(P: Pointer; _Size: _NativeInt): Pointer;
 var
-  Size: _NativeUInt absolute _Size;
-  PP: PPreRec;
+  NewSize: _NativeUInt absolute _Size;
   OldSize: _NativeUInt;
+  NewPP: PPreRec;
+  OldPP: PPreRec;
 begin
   // Delphi never passes nil and always passes positive values:
   // (means: ReallocMem() from zero to non-zero size is done as GetMem(), and ReallocMem() from non-zero to zero size
   // is done as FreeMem().)
   Assert((P <> nil) and (_Size > 0));
 
-  PP := DelphiMem.Dequeue( P );
+  OldPP := DelphiMem.Dequeue( P );
 
-  OldSize := PP^.Size;
+  OldSize := OldPP^.Size;
 
-  if Size < OldSize then begin
+  if NewSize < OldSize then begin
 	// overwrite the released memory, including the old TPostRec data:
-	FillChar((PByte(PP) + sizeof(TPreRec) + Size)^, (OldSize - Size) + sizeof(TPostRec), MyFreeFillByte);
+	FillChar((PByte(OldPP) + sizeof(TPreRec) + NewSize)^, (OldSize - NewSize) + sizeof(TPostRec), MyFreeFillByte);
   end;
 
-  PP := OldMgr.ReallocMem(PP, Size + sizeof(TPreRec) + sizeof(TPostRec));
+  NewPP := OldMgr.ReallocMem(OldPP, NewSize + sizeof(TPreRec) + sizeof(TPostRec));
 
-  if PP = nil then begin
+  if NewPP = nil then begin
+	// not relocated due to some error => enqueue the orginal block:
+	DelphiMem.Enqueue( OldPP, OldSize );
 	if MyBreakOnAllocationError then
 	  MyDebugBreak;
 	exit(nil);
   end;
 
-  // enqueue the block:
-  Result := DelphiMem.Enqueue( PP, Size );
+  // enqueue the relocated block:
+  Result := DelphiMem.Enqueue( NewPP, NewSize );
 
-  if Size > OldSize then begin
+  if NewSize > OldSize then begin
 	// fill the newly allocated memory:
-	FillChar((PByte(Result) + OldSize)^, Size - OldSize, MyAllocFillByte);
+	FillChar((PByte(Result) + OldSize)^, NewSize - OldSize, MyAllocFillByte);
   end;
 end;
 
@@ -535,7 +539,7 @@ end;
 
 
  //===================================================================================================================
- // Chain <Block> to FList.Next. Update statistics. Return pointer to the Payload area of <Block>:
+ // Chain <Block> to FList. Update statistics. Return pointer to the payload area of <Block>:
  //===================================================================================================================
 function TBlockList.Enqueue(Block: PPreRec; Size: _NativeUInt): pointer;
 begin
@@ -567,8 +571,8 @@ end;
 
 
  //===================================================================================================================
- // Unchain <Block>. Update statistics. Return pointer to the TPreRect data.
- // If the block is damaged, a message is issued, trace file output is generated and the process is killed.
+ // Unchain <Payload>. Update statistics. Return pointer to the TPreRect data.
+ // If the block is invalid, a message is issued, trace file output is generated and the process is killed.
  //===================================================================================================================
 function TBlockList.Dequeue(Payload: pointer): PPreRec;
 begin
@@ -579,7 +583,7 @@ begin
 
   FLock.AcquireExclusive;
 
-	// IsValidBlock tests the Prev and Next pointers, which could be alterted by other threads in parallel
+	// IsValidBlock tests the Prev and Next pointers, which could be modified in parallel by other threads.
 	// => the check must be done within the lock
 
 	if not self.IsValidBlock(Result) then begin
@@ -633,7 +637,7 @@ end;
  // - Delphi class: "<ClassName>"
  // - other: "-"
  //===================================================================================================================
-procedure TBlockList.DumpList(Filename: PChar; DoLock, CheckForDelphiClasses: boolean);
+procedure TBlockList.DumpList(Filename: PChar; DoLock, CheckForDelphiClasses, WithHexDump: boolean);
 type
   // from System.pas
   PStrRec = ^TStrRec;
@@ -748,17 +752,20 @@ begin
 	  end;
 
 	  WriteStrToFile(hFile, ['Addr: ', PtrToHex(q), '  Size: ', NUIntToStr(p^.Size), '  Type: ', ClassName, CrLf]);
-	  if p^.Size <= MaxDumpSize then begin
-		// dump whole block:
-		WriteHexDump(hFile, q, p^.Size);
-	  end
-	  else begin
-		// dump only beginning and end of block:
-		WriteHexDump(hFile, q, MaxDumpSize div 2);
-		WriteStrToFile(hFile, ['           .................' + CrLf]);
-		WriteHexDump(hFile, q + p^.Size - MaxDumpSize div 2, MaxDumpSize div 2);
+
+	  if WithHexDump then begin
+		if p^.Size <= MaxDumpSize then begin
+		  // dump whole block:
+		  WriteHexDump(hFile, q, p^.Size);
+		end
+		else begin
+		  // dump only beginning and end of block:
+		  WriteHexDump(hFile, q, MaxDumpSize div 2);
+		  WriteStrToFile(hFile, ['           .................' + CrLf]);
+		  WriteHexDump(hFile, q + p^.Size - MaxDumpSize div 2, MaxDumpSize div 2);
+		end;
+		WriteStrToFile(hFile, [CrLf]);
 	  end;
-	  WriteStrToFile(hFile, [CrLf]);
 
 	  p := p^.Next;
 	end;
@@ -811,7 +818,7 @@ procedure TBlockList.CheckMemoryLeak(IsDelphiMem: boolean);
 begin
   if (FStats.AllocMemSize > FStats.ExpectedMemInbalance) or (FStats.ExpectedMemInbalance = 0) and (FStats.AllocMemBlocks <> 0) then begin
 	SignalError([FStats.Title, ' Memory still allocated: ', NUIntToStr(FStats.AllocMemSize), ' byte in ', NUIntToStr(FStats.AllocMemBlocks) , ' blocks']);
-	self.DumpList('memdump_allocated_blocks.txt', false, IsDelphiMem);
+	self.DumpList('memdump_allocated_blocks.txt', false, IsDelphiMem, true);
   end
   else if FStats.AllocMemSize < FStats.ExpectedMemInbalance then begin
 	SignalError([FStats.Title, ' Memory imbalance detected: ', NUIntToStr(FStats.AllocMemSize), ' <> ', NUIntToStr(FStats.ExpectedMemInbalance)]);
@@ -834,9 +841,9 @@ end;
  // Appends a dump of all allocated memory blocks to the given file.
  // This temporarly blocks all other threads on doing heap operations.
  //===================================================================================================================
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean);
 begin
-  DelphiMem.DumpList(PChar(Filename), true, true);
+  DelphiMem.DumpList(PChar(Filename), true, true, WithHexDump);
 end;
 
 
@@ -1154,129 +1161,6 @@ begin
 end;
 
 
-type
-  // structure to implement IInitializeSpy as a singleton object:
-  TComInitSpy = record
-  strict private
-	class var
-	  FCookie: ULARGE_INTEGER;
-	var
-	  FVMT: pointer;
-
-	function QueryInterface(const IID: TGUID; out Obj: pointer): HResult; stdcall;
-	function AddRef: Integer; stdcall;
-	function Release: Integer; stdcall;
-	function PreInitialize(dwCoInit: DWORD; dwCurThreadAptRefs: DWORD): HRESULT; stdcall;
-	function PostInitialize(hrCoInit: HRESULT; dwCoInit: DWORD; dwNewThreadAptRefs: DWORD): HRESULT; stdcall;
-	function PreUninitialize(dwCurThreadAptRefs: DWORD): HRESULT; stdcall;
-	function PostUninitialize(dwNewThreadAptRefs: DWORD): HRESULT; stdcall;
-  public
-	class procedure Init; static; inline;
-	class procedure Fini; static; inline;
-  end;
-
-
-{ TComInitSpy }
-
- //===================================================================================================================
- //===================================================================================================================
-function TComInitSpy.QueryInterface(const IID: TGUID; out Obj: pointer): HResult;
-begin
-  if IsEqualGUID(IID, IInitializeSpy) then begin
-	Obj := @self;
-	Result := S_OK;
-  end
-  else begin
-	Obj := nil;
-	Result := E_NOINTERFACE;
-  end;
-end;
-
-
- //===================================================================================================================
- // Is called before each of the IInitializeSpy calls
- //===================================================================================================================
-function TComInitSpy.AddRef: Integer;
-begin
-  Result := 1;
-end;
-
-
- //===================================================================================================================
- // Is called after each of the IInitializeSpy calls
- //===================================================================================================================
-function TComInitSpy.Release: Integer;
-begin
-  Result := 1;
-end;
-
-
- //===================================================================================================================
- //===================================================================================================================
-function TComInitSpy.PreInitialize(dwCoInit: DWORD; dwCurThreadAptRefs: DWORD): HRESULT;
-begin
-  Result := S_OK;
-end;
-
-
- //===================================================================================================================
- //===================================================================================================================
-function TComInitSpy.PostInitialize(hrCoInit: HRESULT; dwCoInit: DWORD; dwNewThreadAptRefs: DWORD): HRESULT;
-begin
-  if (hrCoInit = S_OK) or (hrCoInit = S_FALSE) then Windows.InterlockedIncrement(ComInitCount);
-  Result := hrCoInit;
-end;
-
-
- //===================================================================================================================
- //===================================================================================================================
-function TComInitSpy.PreUninitialize(dwCurThreadAptRefs: DWORD): HRESULT;
-begin
-  Windows.InterlockedDecrement(ComInitCount);
-  Result := S_OK;
-end;
-
-
- //===================================================================================================================
- //===================================================================================================================
-function TComInitSpy.PostUninitialize(dwNewThreadAptRefs: DWORD): HRESULT;
-begin
-  Result := S_OK;
-end;
-
-
- //===================================================================================================================
- // install COM initialization monitoring:
- //===================================================================================================================
-class procedure TComInitSpy.Init;
-const
-  VMT: array [0..6] of Pointer =
-  (
-	@TComInitSpy.QueryInterface,
-	@TComInitSpy.AddRef,
-	@TComInitSpy.Release,
-	@TComInitSpy.PreInitialize,
-	@TComInitSpy.PostInitialize,
-	@TComInitSpy.PreUninitialize,
-	@TComInitSpy.PostUninitialize
-  );
-
-  // static singleton COM object:
-  Obj: TComInitSpy = (FVMT: @VMT);
-begin
-  CoRegisterInitializeSpy(IInitializeSpy(@Obj), FCookie);
-end;
-
-
- //===================================================================================================================
- // uninstall COM initialization monitoring (always succeeds):
- //===================================================================================================================
-class procedure TComInitSpy.Fini;
-begin
-  CoRevokeInitializeSpy(FCookie);
-end;
-
-
  //===================================================================================================================
  //===================================================================================================================
 procedure Install;
@@ -1308,9 +1192,6 @@ begin
 
   // install COM memory monitoring:
   TComAllocSpy.Init;
-
-  // install COM initialization monitoring:
-  TComInitSpy.Init;
 end;
 
 
@@ -1320,9 +1201,6 @@ procedure CheckMemoryStatus;
 begin
   // report Delphi memory leaks:
   DelphiMem.CheckMemoryLeak(true);
-
-  // uninstall COM initialization monitoring (always succeeds):
-  TComInitSpy.Fini;
 
   // revoke COM memory monitoring
   TComAllocSpy.Fini;
@@ -1356,7 +1234,7 @@ begin
   Result := true;
 end;
 
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean = true);
 begin
   // nothing
 end;
